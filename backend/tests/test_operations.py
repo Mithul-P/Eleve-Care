@@ -255,7 +255,10 @@ def test_healthy_component_is_never_told_to_replace_itself_for_a_sick_neighbour(
 # API surface - the new endpoints, end to end
 # ---------------------------------------------------------------------------
 
-def test_energy_calendar_endpoint_is_stable(client, staff):
+def test_energy_calendar_endpoint_is_stable(client, staff, monkeypatch):
+    # Current-period totals legitimately grow with time. Keep the clock fixed
+    # so this checks request determinism rather than crossing a rounding boundary.
+    monkeypatch.setattr(opdata, "now_utc", lambda: NOW)
     a = client.get("/analytics/energy/calendar?view=month", headers=staff)
     b = client.get("/analytics/energy/calendar?view=month", headers=staff)
     assert a.status_code == 200
