@@ -73,12 +73,12 @@ export function ChartTooltip({ active, payload, label, labelFormatter, valueForm
 }
 
 export function Loading({ what = 'Loading' }) {
-  return <div className="empty">{what}…</div>
+  return <div className="empty" role="status">{what}…</div>
 }
 
 export function ErrorBox({ error }) {
   if (!error) return null
-  return <div className="error">{error.message || String(error)}</div>
+  return <div className="error" role="alert">{error.message || String(error)}</div>
 }
 
 export const axisProps = {

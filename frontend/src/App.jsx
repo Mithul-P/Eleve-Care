@@ -22,13 +22,14 @@ import SensorInputList from './pages/SensorInputList'
 import TractionLiftSetup from './pages/TractionLiftSetup'
 import TractionLiftConfigure from './pages/TractionLiftConfigure'
 import TractionLiftSummary from './pages/TractionLiftSummary'
+import { Loading } from './components/ui'
 
 // Elevator data is only visible to logged-in admin/staff; the complaint form is public.
 function Protected({ children }) {
   const { user, ready } = useAuth()
   const location = useLocation()
-  if (!ready) return null
-  if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />
+  if (!ready) return <Loading what="Checking your session" />
+  if (!user) return <Navigate to="/login" state={{ from: location.pathname + location.search + location.hash }} replace />
   return <LiveProvider>{children}</LiveProvider>
 }
 
