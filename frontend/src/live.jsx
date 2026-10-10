@@ -65,19 +65,19 @@ export const useLive = () => useContext(LiveCtx)
 /** Fetch helper that refetches when live data changes (keeps previous data while loading). */
 export function useLiveFetch(path, deps = []) {
   const { version } = useLive() || { version: 0 }
-  const [state, setState] = useState({ data: null, error: null, loading: true })
+  const [state, setState] = useState({ path: null, data: null, error: null, loading: true })
   useEffect(() => {
     let alive = true
     // A null/empty path means "nothing to fetch yet" (e.g. the page is still
     // resolving which elevator to show) - stay in the loading state instead of
     // firing a request at a malformed URL.
     if (!path) return undefined
-    setState((s) => ({ ...s, loading: true }))
+    setState((s) => ({ path, data: s.path === path ? s.data : null, error: null, loading: true }))
     api(path)
-      .then((data) => alive && setState({ data, error: null, loading: false }))
+      .then((data) => alive && setState({ path, data, error: null, loading: false }))
       .catch((error) => alive && setState((s) => ({ ...s, error, loading: false })))
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, version, ...deps])
-  return state
+  return state.path === path && path ? state : { data: null, error: null, loading: Boolean(path) }
 }
