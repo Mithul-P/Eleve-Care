@@ -68,6 +68,10 @@ export function useLiveFetch(path, deps = []) {
   const [state, setState] = useState({ data: null, error: null, loading: true })
   useEffect(() => {
     let alive = true
+    // A null/empty path means "nothing to fetch yet" (e.g. the page is still
+    // resolving which elevator to show) - stay in the loading state instead of
+    // firing a request at a malformed URL.
+    if (!path) return undefined
     setState((s) => ({ ...s, loading: true }))
     api(path)
       .then((data) => alive && setState({ data, error: null, loading: false }))

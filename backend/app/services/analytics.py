@@ -12,9 +12,10 @@ from datetime import timedelta
 
 from ..config import Settings
 from ..db import utcnow
+from . import opdata
 from .ml import get_predictor
 
-RANGE_DAYS = {"week": 7, "month": 30, "quarter": 90}
+RANGE_DAYS = {"week": 7, "month": 30, "year": 365, "quarter": 90}
 
 # Indicative maintenance economics (INR) for a mid-rise traction lift in India.
 # "emergency" includes call-out, expedited parts, overtime and secondary damage.
@@ -23,6 +24,82 @@ MAINTENANCE_COST_INR = {
     "sheave": {"planned": 120_000, "emergency": 220_000, "downtime_planned_h": 10, "downtime_emergency_h": 60},
     "bearing": {"planned": 25_000, "emergency": 90_000, "downtime_planned_h": 4, "downtime_emergency_h": 36},
     "traction": {"planned": 350_000, "emergency": 650_000, "downtime_planned_h": 16, "downtime_emergency_h": 96},
+}
+
+# Metric explanations for Energy Savings Analysis (Section 14)
+SAVINGS_METRIC_EXPLANATIONS = {
+    "avoided_repair_cost": {
+        "title": "Avoided repair cost",
+        "meaning": "Estimated monetary saving achieved by conducting planned predictive maintenance instead of allowing parts to fail in-service.",
+        "source": "Standard Indian market maintenance economics (MAINTENANCE_COST_INR) across flagged at-risk and medium components.",
+        "calculation": "Sum of (emergency_cost_inr - planned_cost_inr) for all degraded components.",
+        "formula": "Avoided Cost = Emergency Replacement Cost - Planned Service Cost",
+        "why_it_matters": "In-service failures incur emergency technician call-out surcharges, expedited part shipping, and collateral damage to adjacent drive parts.",
+        "interpretation": "A larger total indicates substantial near-term cost avoidance by addressing currently open work recommendations."
+    },
+    "risk_weighted_saving": {
+        "title": "Risk-weighted saving",
+        "meaning": "The expected value of maintenance savings adjusted for the actual probability that each component would fail within the 30-day horizon.",
+        "source": "Monotonic ML failure probability model blended with component-level emergency cost deltas.",
+        "calculation": "Sum of max(failure_probability, 10%) × (emergency_cost - planned_cost) across flagged parts.",
+        "formula": "Risk-Weighted Saving = ∑ [ max(P(fail), 0.10) × (Emergency Cost - Planned Cost) ]",
+        "why_it_matters": "Prioritises budget allocation towards components that represent immediate, high-probability failure threats rather than distant risks.",
+        "interpretation": "Reflects actuarially sound expected savings over the immediate 30-day operating cycle."
+    },
+    "downtime_avoided": {
+        "title": "Downtime avoided",
+        "meaning": "Hours of elevator outage saved by scheduling planned component replacements during low-traffic periods versus reactive shutdowns.",
+        "source": "Industry downtime benchmarks: planned off-peak window vs emergency shutdown with part lead times.",
+        "calculation": "Sum of (downtime_emergency_h - downtime_planned_h) across all flagged components.",
+        "formula": "Downtime Avoided = Emergency Outage Hours - Planned Maintenance Hours",
+        "why_it_matters": "Passenger inconvenience, tenant complaints, and building operational disruption are minimized when maintenance is pre-scheduled.",
+        "interpretation": "Shows the direct availability benefit delivered to building occupants and property management."
+    },
+    "failure_risk": {
+        "title": "Failure risk",
+        "meaning": "The calibrated probability that a monitored component will reach discard limits or experience functional failure within 30 days.",
+        "source": "Monotonic Gradient-Boosted Trees classifier combining FFT vibration features and physics degradation indices.",
+        "calculation": "P(failure in 30 days) evaluated from rolling 24 h and 7-day feature windows.",
+        "formula": "P_fail = Model_Prob(vibration_rms, defect_band_ratio, physics_life_fraction, current_ratio)",
+        "why_it_matters": "Allows maintenance teams to intervene before safety gear deployment or mid-travel entrapment occurs.",
+        "interpretation": "Values above 35% trigger 'high risk' alerts; above 60% are classified as critical replacements."
+    },
+    "rul": {
+        "title": "Remaining useful life (RUL)",
+        "meaning": "The estimated number of operating days remaining before the component reaches standard safety discard criteria.",
+        "source": "ML monotonic regressor capped by physics first-pass degradation rates (Feyrer, Archard, L10, Miner).",
+        "calculation": "exp(Regressor(X)) clipped to physics design life and clamped by active safety escalation rules.",
+        "formula": "RUL = min(RUL_ML, RUL_physics_cap) with engineering rule overrides",
+        "why_it_matters": "Determines the precise urgency window and deadline date for procurement and technician dispatch.",
+        "interpretation": "An RUL under 30 days requires urgent scheduling within the current monthly maintenance cycle."
+    },
+    "planned": {
+        "title": "Planned replacement cost",
+        "meaning": "Standard scheduled component replacement cost including standard labor and planned OEM part procurement.",
+        "source": "Pre-negotiated annual maintenance service contract rates.",
+        "calculation": "Fixed schedule rates per component type from MAINTENANCE_COST_INR table.",
+        "formula": "Fixed benchmark cost (e.g. ₹1.8L for ropes, ₹1.2L for sheave, ₹3.5L for machine).",
+        "why_it_matters": "Represents the baseline controllable expenditure under condition-based maintenance.",
+        "interpretation": "Budgeted cost of executing recommended preventative actions."
+    },
+    "emergency": {
+        "title": "Emergency replacement cost",
+        "meaning": "Unplanned breakdown cost including emergency technician call-outs, overnight expedited part logistics, and potential collateral shaft damage.",
+        "source": "Historical reactive breakdown service invoices.",
+        "calculation": "Emergency rate per component type incorporating emergency labor, urgent procurement premiums, and consequential repair.",
+        "formula": "Emergency Cost = Planned Cost + Call-out Premium + Logistics Expediting + Secondary Damage",
+        "why_it_matters": "Demonstrates the true financial penalty of running elevator equipment to failure.",
+        "interpretation": "Financial exposure incurred if predictive recommendations are ignored."
+    },
+    "avoided": {
+        "title": "Avoided cost",
+        "meaning": "Net capital and operational expense avoided on an individual component by intervening predictively.",
+        "source": "Component-specific differential between reactive emergency and planned intervention costs.",
+        "calculation": "emergency_cost_inr - planned_cost_inr for this specific component.",
+        "formula": "Avoided = Emergency Cost - Planned Cost",
+        "why_it_matters": "Directly justifies the return on investment (ROI) for replacing this specific part now.",
+        "interpretation": "Direct financial saving achieved by approving this maintenance card."
+    }
 }
 
 # Embodied carbon of replacement parts (kg CO2e): mass x material factor.
@@ -38,18 +115,6 @@ EMBODIED_CO2_KG = {
 TIME_BASED_REPLACEMENT_FRACTION = 0.75
 CONDITION_BASED_REPLACEMENT_FRACTION = 0.95
 
-CIRCULAR_ECONOMY_NOTES = [
-    {"title": "Regroove, don't replace, sheaves",
-     "text": "Early detection of groove wear allows re-grooving the sheave in place, avoiding ~570 kg CO2e of new cast iron."},
-    {"title": "Rope steel recycling",
-     "text": "Retired galvanised ropes are ~100% recyclable steel; segregated collection keeps them out of mixed scrap."},
-    {"title": "Bearing remanufacturing",
-     "text": "Bearings replaced at the first sign of spalling (kurtosis rise) can often be remanufactured instead of scrapped, and prevent secondary damage to shafts."},
-    {"title": "Motor rewinding",
-     "text": "Catching winding over-temperature early allows rewinding traction motors rather than replacing the whole machine."},
-    {"title": "Right-time replacement",
-     "text": "Condition-based replacement uses more of every part's real life than calendar-based swaps, cutting part consumption and transport emissions."},
-]
 
 
 def _since(range_: str) -> str:
@@ -153,6 +218,7 @@ async def maintenance_savings(db, elevator_id: str | None = None) -> dict:
         "total_avoided_inr": sum(r["avoided_cost_inr"] for r in rows),
         "risk_weighted_avoided_inr": sum(r["risk_weighted_avoided_inr"] for r in rows),
         "downtime_avoided_h": sum(r["downtime_avoided_h"] for r in rows),
+        "metric_explanations": SAVINGS_METRIC_EXPLANATIONS,
         "assumptions": [
             "Planned vs emergency costs are indicative INR figures for a mid-rise traction lift "
             "(emergency includes call-out, expedited parts, overtime and secondary damage).",
@@ -162,15 +228,38 @@ async def maintenance_savings(db, elevator_id: str | None = None) -> dict:
     }
 
 
-async def sustainability_report(db, s: Settings, range_: str = "month") -> dict:
-    energy = await energy_report(db, s, range_)
+async def sustainability_report(db, s: Settings, range_: str = "month", elevator_id: str | None = None) -> dict:
+    energy = await energy_report(db, s, range_, elevator_id)
     t = energy["totals"]
     ef = s.grid_emission_kg_per_kwh
     n_days = max(1, t["complete_days"])
     full_kwh = sum(d["energy_kwh"] for d in energy["daily"])
     full_excess = sum(d["excess_kwh"] for d in energy["daily"])
+
+    # Section 2 fix - the chart below the KPI cards must be bucketed at the
+    # SAME granularity the person clicked (week/month/year), not always the
+    # per-day rows `energy_report` returns. Reuses the exact seeded bucketing
+    # `energy_calendar` already uses for the Cost & Energy page, so a week,
+    # month or year here always matches what that page would show.
+    if elevator_id:
+        elev = await db.elevators.find_one({"_id": elevator_id})
+        cal_elevators = [elev] if elev else []
+    else:
+        cal_elevators = [e async for e in db.elevators.find({})]
+    cal_view = range_ if range_ in ("week", "month", "year") else "month"
+    calendar = opdata.energy_calendar(cal_elevators, s.energy_tariff_inr_per_kwh, cal_view)
+    periods = [{
+        "key": r.get("month") or r.get("week") or str(r.get("year")),
+        "label": r["label"],
+        "energy_kwh": r["energy_kwh"],
+        "co2_kg": round(r["energy_kwh"] * ef, 2),
+        "excess_co2_kg": round(r["excess_kwh"] * ef, 3),
+        "state": r["state"],
+    } for r in calendar["rows"]]
+
     counts: dict[str, int] = defaultdict(int)
-    async for c in db.components.find({}, {"type": 1}):
+    q_comp = {"elevator_id": elevator_id} if elevator_id else {}
+    async for c in db.components.find(q_comp, {"type": 1}):
         counts[c["type"]] += 1
 
     metrics = get_predictor().metrics
@@ -198,8 +287,15 @@ async def sustainability_report(db, s: Settings, range_: str = "month") -> dict:
             "avoided_co2_kg_per_year": round(avoided * co2_per_part, 0),
             "material": emb["material"],
         })
+    elevator_name = None
+    if elevator_id:
+        e = await db.elevators.find_one({"_id": elevator_id}, {"name": 1})
+        elevator_name = e.get("name") if e else None
+
     return {
         "range": range_,
+        "elevator_id": elevator_id,
+        "elevator_name": elevator_name,
         "grid_emission_kg_per_kwh": ef,
         "operational": {
             "energy_kwh": t["energy_kwh"],
@@ -207,15 +303,15 @@ async def sustainability_report(db, s: Settings, range_: str = "month") -> dict:
             "excess_co2_kg": round(t["excess_kwh"] * ef, 2),
             "projected_annual_co2_kg": round(full_kwh / n_days * 365 * ef, 0),
             "projected_annual_excess_co2_kg": round(full_excess / n_days * 365 * ef, 1),
-            "daily": [{"date": d["date"], "co2_kg": round(d["energy_kwh"] * ef, 2),
-                       "excess_co2_kg": round(d["excess_kwh"] * ef, 3)} for d in energy["daily"]],
+            "period_view": cal_view,
+            "period_label": calendar["period_label"],
+            "periods": periods,
         },
         "life_extension": {
             "components": sorted(life_rows, key=lambda r: r["type"]),
             "avoided_replacements_per_year": round(total_avoided_parts, 2),
             "avoided_embodied_co2_kg_per_year": round(total_avoided_co2, 0),
         },
-        "circular_economy": CIRCULAR_ECONOMY_NOTES,
         "assumptions": [
             f"Grid emission factor {ef} kg CO2/kWh (India grid average, CEA CO2 baseline database).",
             f"Time-based maintenance replaces parts at {TIME_BASED_REPLACEMENT_FRACTION:.0%} of typical life; "

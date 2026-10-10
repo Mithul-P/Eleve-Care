@@ -57,8 +57,8 @@ class Settings(BaseSettings):
 
     # --- chatbot (Claude) ---
     anthropic_api_key: str = ""                  # optional; rule-based assistant is used when absent
-    chatbot_model: str = "claude-opus-5"
-    chatbot_effort: Literal["low", "medium", "high"] = "low"
+    chatbot_model: str = "claude-sonnet-4-6"
+    chatbot_max_tokens: int = 1200
 
     # --- economics / sustainability ---
     energy_tariff_inr_per_kwh: float = 5.0

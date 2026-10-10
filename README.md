@@ -13,17 +13,22 @@ Built for the **KONE Elevate** challenge by team **Syntax Syndicate**.
 
 ---
 
+## Round 5 - traction only, material specs, lift report, sensor inputs
+Every elevator is a **traction lift** (fixed badge). Each component has a **Materials & specification** form (industry presets, units, completeness, GSM rule) whose values feed the physics laws; the Model card shows which inputs are yours and which are defaults. Each elevator has a printable **Lift report** (`/elevators/:id/report`) whose suspension-rope section names the faulty rope in plain language, and a **Sensor inputs** page (`/elevators/:id/sensors`) with a sensor registry, a live stream monitor and ingestion tools (`POST /ingest/sensor-data`, `WS /ws/ingest/{id}`, header/query `X-Ingest-Key` / `key`, set `INGEST_API_KEY`). Details in `CHANGES.md`.
+
 ## What's inside
 
 | Area | Highlights |
 |---|---|
-| **Simulated data engine** | Physics-based degradation (Basquin/Miner fatigue + Paris-law acceleration), not random noise. **Batch** (6 h chunks) and **real-time** (every 3 s, WebSocket) modes with a toggle. Pluggable `SensorSource` → swap in a real feed without touching ML/API/UI. |
+| **Simulated data engine** | Physics-based degradation from one approved law per component - **Feyrer** rope fatigue, **Archard** sheave wear, **Lundberg-Palmgren L10** bearing life, **Palmgren-Miner + Arrhenius** for the machine - plus Paris-law acceleration; not random noise. **Batch** (6 h chunks) and **real-time** (every 3 s, WebSocket) modes with a toggle. Pluggable `SensorSource` → swap in a real feed without touching ML/API/UI. |
 | **Hardcore demo elevator** | `Tower A - Lift 3 (Demo)`: a rope set with an abnormal, widening tension imbalance. Over the seeded 60 days it goes good → medium → **at-risk**, with a plain-English explanation and recommended action. |
-| **ML layer (`/ml`)** | FFT and statistical vibration features (RMS, crest, kurtosis, defect-band energy) plus physics features (tension imbalance, current vs rated, temperature rise, Miner fatigue index). **Monotonic gradient-boosted trees** give P(failure) and RUL. The health score blends in physics severity, and explanations rank the contributing factors. |
+| **ML layer (`/ml`)** | FFT and statistical vibration features (RMS, crest, kurtosis, defect-band energy) plus physics features (tension imbalance, current vs rated, temperature rise, life fraction from the component's law). **Monotonic gradient-boosted trees** give P(failure) and RUL; a physics first-pass RUL caps the ML estimate late in life. The health score blends in physics severity, and explanations rank the contributing factors. Training is vectorised and parallel (~8 s on 4 cores). |
+| **Rule layer (`rules.py`)** | Runs after the model on every prediction. Escalation rules (crossed alarm limits, rated life used, active growth, fast response on the last 3 readings, score consistency) stop small issues becoming big ones; de-escalation rules (unconfirmed model signal, hysteresis with a dead-band, low confidence) stop small blips becoming big alarms. Every fired rule is shown with its reason. |
+| **Waveform analysis** | Per trace: time statistics, FFT spectrum, **envelope (Hilbert) spectrum**, the component's characteristic fault frequencies (BPFO, groove-pass, 2x line, sway) with SNR, band-energy split and a plain-language diagnosis. `GET /components/{id}/waveform`, `POST /components/{id}/waveform/analyze` for handheld traces. |
 | **Dashboard** | Fleet overview → elevator detail (components sorted at-risk → medium → good) → component detail. The component page has health and failure graphs (week/month), a condition-indicator trend with healthy/alarm limits, waveform + FFT spectrum, per-rope tension, and maintenance actions. |
 | **Cost & energy** | Daily energy (healthy baseline vs excess from degradation) and cost at **₹5/unit**, per-elevator breakdown, and predictive-vs-reactive savings analysis. |
 | **Sustainability** | Operational CO₂ (India grid factor), avoidable CO₂ from degradation, component life extension and avoided embodied carbon, circular-economy notes. |
-| **AI assistant** | Answers health/RUL/checkup/complaint/energy questions grounded in live data and proactively raises near-failure and checkup-due alerts. Uses **Claude** when `ANTHROPIC_API_KEY` is set, otherwise a built-in rule engine (the demo never depends on a network). |
+| **AI assistant** | Situation reports on any elevator or component: what is happening, 7/30-day health trend and decay rate, projected days to at-risk, life used and the law behind it, rules fired, what the waveform shows, trips/day and energy vs a healthy baseline, next action. Also answers health/RUL/checkup/complaint/energy questions and proactively raises near-failure and checkup-due alerts. Uses **Claude** when `ANTHROPIC_API_KEY` is set, otherwise a built-in rule engine (the demo never depends on a network). |
 | **Complaints** | Public **no-login** form (`/report` or `/report/<elevator-id>`, e.g. a QR code in each car). Rate-limited. Complaints show up as live notifications in that elevator's admin view. |
 | **Access control** | Elevator data is only visible to logged-in **admin/staff** (JWT). Admin-only: simulator mode switch, user creation. |
 
@@ -83,8 +88,9 @@ cp ../.env.example .env        # edit values; or export them
 uvicorn app.main:app --reload --port 8000
 ```
 
-On first start the backend trains the models if `ml/artifacts/models.joblib` is missing (~45 s).
-Run `python -m elevcare_ml.train` from `/ml` to retrain on demand.
+On first start the backend trains the models if `ml/artifacts/models.joblib` is missing (~8 s on
+4 cores, ~27 s on one). Run `python -m elevcare_ml.train` from `/ml` to retrain on demand
+(`--jobs 1` for serial).
 
 ```bash
 # frontend (second terminal)
@@ -116,7 +122,11 @@ cd backend && pytest -q       # API end to end on an in-memory DB (auth, complai
    30 days. The *Condition indicator* shows imbalance climbing through the alarm line. The
    per-rope tension chart shows rope R6 carrying +19%. The spectrum shows energy concentrated
    in the rope-sway band.
-4. Open the **assistant** → *"Why is the demo lift's rope at risk?"*
+4. Open the **assistant** → *"What is happening with the demo lift?"* then *"Why is the rope at
+   risk?"* - it reports the 30-day decay, the Feyrer life fraction, any rules that fired and
+   what the waveform shows. Scroll to **Waveform analysis** on the rope page: the envelope
+   spectrum and characteristic-frequency table explain the sway signature. On *Tower A - Lift 2*
+   the bearing's envelope spectrum shows the BPFO line 20+ dB above the floor.
 5. Switch the header toggle to **Real-time**: waveforms and scores update every 3 s over
    WebSocket. Switch back to **Batch** and press **Run batch now** to ingest a 6-hour chunk.
 6. **Record replacement** on the rope → it resets to healthy, and new readings confirm it.
@@ -130,16 +140,26 @@ cd backend && pytest -q       # API end to end on an in-memory DB (auth, complai
 
 ## The physics-informed model (for the judges)
 
-**1. Degradation physics (simulator, `ml/elevcare_ml/simulator.py`).** Every component has a
-hidden damage `D ∈ [0,1]`:
+**1. Degradation physics (`ml/elevcare_ml/physics.py`, used by the simulator, training and the
+live pipeline alike).** Each component follows its standard published law, calibrated so that
+`N(nominal load) = rated life`, and accumulated with Palmgren-Miner:
+
+| Component | Law | Formula | Life feature |
+|---|---|---|---|
+| Rope | Feyrer bending fatigue | `N_f = C (D/d)^a (S_u/S)^b`, a = b = 4.5, D/d = 40 | `fatigue_fraction` |
+| Sheave | Archard groove wear (+ contact-pressure feedback) | `Q = k W L / H`, h = Q / A_groove vs 1.5 mm limit | `wear_depth_proxy` |
+| Bearing | Lundberg-Palmgren | `L10 = (C/P)^p`, p = 10/3 | `l10_life_fraction` |
+| Traction | Palmgren-Miner + Arrhenius | `D = Σ n_i/N_i`, rate ×2 per +10 °C winding rise | `cumulative_damage_D` |
+
+Every component also has a hidden damage `D ∈ [0,1]` in the simulator:
 
 ```
-dD = trips · L^m / N_rated / life_scale · (1 + k·D)
-      └── Basquin/Palmgren-Miner fatigue ──┘   └ Paris-law-style acceleration
+dD = trips / N(L) / life_scale · (1 + k·D)
+      └── approved law ──┘   └ Paris-law-style acceleration
 ```
 
 `L` is the load factor. For ropes it is the **most-loaded rope**, `1 + imbalance`: that is why
-tension imbalance is so damaging (with `m ≈ 4.5`, a rope carrying 20% extra ages ~2.3× faster).
+tension imbalance is so damaging (with `b ≈ 4.5`, a rope carrying 20% extra ages ~2.3× faster).
 Sensor readings are generated *from* `D`:
 - widening rope-tension spread
 - vibration signatures in each component's defect band (rope sway 4-16 Hz, sheave groove-pass
@@ -166,11 +186,34 @@ blend means an engineering limit is respected even before the model has seen a s
 Contributing factors are ranked by severity × (physics weight + ML permutation importance),
 and each factor carries recommended-action advice.
 
-| Status | Rule |
+| Model verdict | Rule |
 |---|---|
 | at-risk | P_fail ≥ 50% or health < 45 or RUL < 30 d |
 | medium | P_fail ≥ 20% or health < 72 or RUL < 120 d |
 | good | otherwise |
+
+**5. Rule layer (`rules.py`).** The model verdict then passes through engineering rules:
+
+| Rule | Family | What it does |
+|---|---|---|
+| R1 alarm-limit override | escalate | indicator past alarm ⇒ ≥ medium; primary indicator past alarm + second indicator or growth trend ⇒ at-risk |
+| R2 rated life consumed | escalate | ≥ 100 % life ⇒ at-risk; ≥ 85 % ⇒ medium |
+| R3 active growth | escalate | trend above alarm rate while level is half-way to alarm ⇒ one step up |
+| R4 fast response | escalate | above alarm on each of the last 3 raw readings ⇒ one step up now (no 24 h lag) |
+| R5 score consistency | cap | RUL ≤ 45 d at-risk / 180 d medium; physics remaining life caps ML RUL once > 50 % life used |
+| R6 unconfirmed ML | hold | ML at-risk with no indicator half-way to alarm and < 70 % life ⇒ held at medium, inspect |
+| R7 hysteresis | hold | improve only after 3 consecutive better evaluations and once indicators clear a 15 % dead-band |
+| R8 low confidence | flag | < 4 readings in the window ⇒ provisional |
+
+The demo fleet shows what this buys: over 60 seeded days no component changes status more than
+a handful of times, and every change carries the rule that caused it.
+
+**6. Waveform analysis (`signal.analyze_waveform`).** Beyond the model features, each trace gets
+an envelope spectrum (analytic-signal demodulation). A bearing spall produces periodic impacts
+that ring the housing at ~320 Hz; the impact *rate* (BPFO ≈ 87 Hz) is invisible in the raw FFT but
+stands out in the envelope spectrum - the standard bearing-diagnostics technique. Each
+characteristic line is reported with its SNR and whether it is merely *visible* (rope sway is
+always present) or *elevated* above its healthy amplitude.
 
 Checkup interval follows status: 90 / 30 / 7 days.
 
@@ -186,6 +229,7 @@ Interactive docs are at `/docs`. Main endpoints:
 | GET | `/auth/me`, POST `/auth/users` | user / admin |
 | GET | `/elevators`, `/elevators/{id}`, `/elevators/{id}/components` | staff |
 | GET | `/components/{id}`, `/components/{id}/history?range=week\|month`, `/components/{id}/prediction`, `/components/{id}/waveform` | staff |
+| POST | `/components/{id}/waveform/analyze` (analyse an uploaded trace) | staff |
 | POST | `/components/{id}/maintenance` (`inspection` \| `replacement`) | staff |
 | GET | `/elevators/{id}/energy`, `/analytics/energy`, `/analytics/sustainability`, `/analytics/model` | staff |
 | POST | `/complaints` | **public** (rate-limited) |

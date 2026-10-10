@@ -15,10 +15,17 @@ Blending means the score reacts to an engineering limit being crossed even
 before the ML model has seen a similar failure, and the ML model contributes
 learned interactions (e.g. imbalance *and* high fatigue together).
 
-Status rules (sorted at-risk -> medium -> good in the UI):
+Status (sorted at-risk -> medium -> good in the UI) - two stages:
+  1. model verdict
     at-risk : P_fail >= 0.5  or health < 45  or RUL < 30 days
     medium  : P_fail >= 0.2  or health < 72  or RUL < 120 days
     good    : otherwise
+  2. rule layer (rules.py) - engineering limits, rated life, growth trends and
+     fast-response escalate; unconfirmed model signals, hysteresis and
+     low-confidence de-escalate / hold. Every fired rule is reported.
+
+RUL is hybrid: the physics first pass (1 - life_fraction) / consumption rate
+caps the ML regressor once more than half the rated life is used (spec 5.2).
 """
 
 from __future__ import annotations
@@ -31,7 +38,8 @@ import joblib
 import numpy as np
 
 from . import physics as P
-from .features import to_vector
+from .features import to_matrix
+from .rules import apply_rules
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +48,22 @@ RUL_CAP_DAYS = 3650.0
 
 COMPONENT_LABELS = {"rope": "Suspension ropes", "sheave": "Traction sheave",
                     "bearing": "Sheave bearing", "traction": "Traction machine"}
+
+
+def physics_first_pass_rul(life_fraction: float, life_rate_per_day: float) -> float:
+    """
+    Spec 5.2 first pass: remaining life from the component's life law alone.
+    The simulator's documented Paris-law term (dD/dn grows as (1 + k D)) is
+    included, so the estimate integrates  dD / (rate (1 + k D))  from the
+    current life fraction to 1:  t = ln((1 + k) / (1 + k D)) / (k rate).
+    With k -> 0 this is the plain (1 - D) / rate.
+    """
+    k = P.DAMAGE_ACCELERATION
+    d = min(max(float(life_fraction), 0.0), 1.0)
+    r = max(float(life_rate_per_day), 1e-9) * (1.0 + k * d)   # observed rate already includes today's acceleration
+    base_rate = r / (1.0 + k * d)
+    t = np.log((1.0 + k) / (1.0 + k * d)) / (k * base_rate)
+    return float(np.clip(t, 0.0, RUL_CAP_DAYS))
 
 
 def classify(health: float, p_fail: float, rul_days: float) -> str:
@@ -94,14 +118,38 @@ class Predictor:
         self.path = Path(artifact_path) if artifact_path else DEFAULT_ARTIFACT
         with self._lock:
             if not self.path.exists():
-                if not auto_train:
-                    raise FileNotFoundError(f"model artifact not found: {self.path}")
-                from .train import train_all
-
-                log.warning("No trained models at %s - training now (one-off)...", self.path)
-                train_all(self.path.parent, **(train_kwargs or {}))
-            self.bundle = joblib.load(self.path)
+                self._train_fresh(auto_train, train_kwargs, reason="no artifact found")
+            try:
+                self.bundle = joblib.load(self.path)
+            except Exception as exc:
+                # A committed model artifact is a pickle of scikit-learn's own
+                # objects (including private classes such as HistGradientBoosting's
+                # internal loss functions). Unpickling is only guaranteed to work
+                # with the *exact* scikit-learn version that created the file - a
+                # different version (even a compatible-looking one), a corrupted
+                # download, or a git checkout that mangled a binary file all
+                # surface as an unpickling error, most often
+                # `ModuleNotFoundError: No module named '_loss'` when the
+                # scikit-learn version differs from the one that trained the
+                # model. Rather than let that crash the whole application on
+                # startup, retrain a fresh set of models in the same place -
+                # training takes seconds, and the retrained bundle always
+                # matches whatever scikit-learn is actually installed.
+                log.warning("Could not load model artifact at %s (%s: %s) - "
+                           "retraining fresh models with the installed scikit-learn "
+                           "version instead.", self.path, type(exc).__name__, exc)
+                self._train_fresh(auto_train, train_kwargs,
+                                  reason=f"existing artifact failed to load ({type(exc).__name__})")
+                self.bundle = joblib.load(self.path)
         self.version: str = self.bundle["version"]
+
+    def _train_fresh(self, auto_train: bool, train_kwargs: dict | None, reason: str) -> None:
+        if not auto_train:
+            raise FileNotFoundError(f"model artifact unusable at {self.path} ({reason}) and auto_train is disabled")
+        from .train import train_all
+
+        log.warning("Training models at %s (%s)...", self.path, reason)
+        train_all(self.path.parent, **(train_kwargs or {}))
 
     @property
     def metrics(self) -> dict:
@@ -110,33 +158,63 @@ class Predictor:
     def importances(self, ctype: str) -> dict[str, float]:
         return self.bundle["models"][ctype]["importances"]
 
-    def predict_many(self, ctype: str, feats_list: list[dict[str, float]]) -> list[dict]:
+    def predict_many(self, ctype: str, feats_list: list[dict[str, float]],
+                     contexts: list[dict | None] | None = None) -> list[dict]:
+        """
+        Batched inference (one sklearn call for all components of a type).
+        `contexts[i]` carries the rule-layer inputs for component i - see
+        rules.apply_rules - and may be None.
+        """
         if not feats_list:
             return []
         m = self.bundle["models"][ctype]
-        X = np.vstack([to_vector(f) for f in feats_list])
+        X = to_matrix(feats_list)
         p_fail = m["classifier"].predict_proba(X)[:, 1]
         rul = np.clip(np.expm1(m["regressor"].predict(X)), 0.0, RUL_CAP_DAYS)
-        return [self._compose(ctype, f, float(p), float(r)) for f, p, r in zip(feats_list, p_fail, rul)]
+        contexts = contexts or [None] * len(feats_list)
+        return [self._compose(ctype, f, float(p), float(r), c)
+                for f, p, r, c in zip(feats_list, p_fail, rul, contexts)]
 
-    def predict(self, ctype: str, feats: dict[str, float]) -> dict:
-        return self.predict_many(ctype, [feats])[0]
+    def predict(self, ctype: str, feats: dict[str, float], context: dict | None = None) -> dict:
+        return self.predict_many(ctype, [feats], [context])[0]
 
     # ------------------------------------------------------------------
-    def _compose(self, ctype: str, feats: dict[str, float], p_fail: float, rul: float) -> dict:
+    def _compose(self, ctype: str, feats: dict[str, float], p_fail: float, rul: float,
+                 context: dict | None = None) -> dict:
         s_phys, sev = physics_severity(ctype, feats)
         health = float(np.clip(100.0 * (1.0 - 0.5 * p_fail - 0.5 * s_phys), 0.0, 100.0))
-        status = classify(health, p_fail, rul)
+        ml_status = classify(health, p_fail, rul)
+        ctx = dict(context or {})
+        life = float(feats.get("fatigue_index", 0.0))
+        rate = ctx.get("life_rate_per_day")
+        if ctx.get("physics_rul_days") is None and rate and rate > 0:
+            ctx["physics_rul_days"] = physics_first_pass_rul(life, rate)
+        ruled = apply_rules(ctype, feats, sev, ml_status, p_fail, rul, health, ctx)
+        status, rul_f, health_f = ruled["status"], ruled["rul_days"], ruled["health_score"]
         factors = self.contributing_factors(ctype, feats, sev)
+        model = P.PHYSICS_MODEL[ctype]
         return {
-            "health_score": round(health, 1),
+            "health_score": round(health_f, 1),
             "failure_probability": round(p_fail * 100.0, 1),  # percent, within horizon
             "horizon_days": P.FAILURE_HORIZON_DAYS,
-            "rul_days": round(rul, 1),
+            "rul_days": round(rul_f, 1),
             "status": status,
+            "ml_status": ml_status,
+            "status_source": ruled["status_source"],
+            "confidence": ruled["confidence"],
+            "rules_fired": ruled["rules_fired"],
+            "candidate_status": ruled["candidate_status"],
+            "status_streak": ruled["status_streak"],
             "physics_severity": round(s_phys, 3),
+            "physics": {
+                "model": model["name"], "formula": model["formula"], "feature": model["feature"],
+                "label": model["label"], "life_fraction": round(life, 4),
+                "ml_rul_days": round(rul, 1),
+                "physics_rul_days": (round(float(ctx["physics_rul_days"]), 1)
+                                     if ctx.get("physics_rul_days") is not None else None),
+            },
             "contributing_factors": factors,
-            "explanation": self.explain(ctype, status, health, p_fail, rul, factors),
+            "explanation": self.explain(ctype, status, health_f, p_fail, rul_f, factors, ruled["rules_fired"]),
             "model_version": self.version,
             "features": {k: round(float(v), 5) for k, v in feats.items()},
         }
@@ -168,7 +246,8 @@ class Predictor:
         return [r for r in rows if r["severity"] > 0.05][:top_k]
 
     @staticmethod
-    def explain(ctype: str, status: str, health: float, p_fail: float, rul: float, factors: list[dict]) -> str:
+    def explain(ctype: str, status: str, health: float, p_fail: float, rul: float, factors: list[dict],
+                rules_fired: list[dict] | None = None) -> str:
         name = COMPONENT_LABELS[ctype]
         head = {
             "at-risk": f"{name} AT RISK",
@@ -187,4 +266,7 @@ class Predictor:
         text = summary + " Key drivers: " + "; ".join(drivers) + "."
         if status != "good" and factors[0]["advice"]:
             text += " Recommended: " + factors[0]["advice"]
+        esc = [r for r in (rules_fired or []) if r["effect"] in ("escalate", "hold")]
+        if esc:
+            text += f" Rule {esc[0]['id']} ({esc[0]['name'].lower()}) applied: {esc[0]['message']}"
         return text

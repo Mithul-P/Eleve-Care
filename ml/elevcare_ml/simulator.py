@@ -4,11 +4,13 @@ Physics-based degradation simulator for elevator suspension components.
 Instead of random noise, every component carries a hidden *damage* variable
 D in [0, 1] (1 = end of life) that evolves with use:
 
-    dD = (L^m / N_rated) * trips / life_scale * (1 + k * D)
-         `-- Basquin/Miner --'           `-- Paris-law acceleration
+    dD = trips / N(L) / life_scale * (1 + k * D)
+         `-- approved life law --'  `-- Paris-law acceleration
 
+* N(L)       cycles-to-failure at load factor L from the component's approved
+             model (physics.life_increment): Feyrer for ropes, Archard for the
+             sheave, Lundberg-Palmgren L10 for bearings, Miner for the machine
 * L          load factor on the component (the most-loaded rope for a rope set)
-* m          Basquin exponent (physics.BASQUIN_EXPONENT)
 * life_scale per-unit manufacturing/installation variability (hidden)
 * k          damage acceleration once defects have started
 
@@ -120,8 +122,8 @@ def advance(profile: Profile, state: State, dt_hours: float, rng: np.random.Gene
         load = passenger_load * (1.0 + state.imbalance_pct / 100.0)
     else:
         load = passenger_load
-    m = P.BASQUIN_EXPONENT[ctype]
-    base = trips * np.maximum(load, 0.05) ** m / P.RATED_CYCLES[ctype]
+    # Life-fraction consumed this interval from the component's approved law.
+    base = P.life_increment(ctype, trips, load)
     d_damage = base / profile.life_scale * (1.0 + P.DAMAGE_ACCELERATION * state.damage)
     # A failed unit stays failed; clamp so run-to-failure loops stay finite.
     state.damage = np.minimum(state.damage + d_damage, 1.5)

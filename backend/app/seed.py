@@ -22,12 +22,14 @@ from datetime import timedelta
 
 import numpy as np
 
+from elevcare_ml import materials as MATERIALS
 from elevcare_ml import simulator as S
 
 from .config import Settings, get_settings
 from .db import connect, disconnect, utcnow
 from .security import hash_password
 from .services.ingestion import IngestionPipeline
+from .services.sensor_hub import default_sensors
 from .services.simulated_source import SimulatedSource
 
 log = logging.getLogger(__name__)
@@ -38,6 +40,36 @@ COMPONENT_NAMES = {
     "bearing": "Sheave bearing",
     "traction": "Traction machine",
 }
+
+# Realistic default material specification per component, per elevator, so the
+# fleet is never seeded at 0% material completeness (spec section 2/8 - the
+# fleet-wide Materials page always has something real to list). Diversity
+# across elevators keeps that list from showing the same material six times.
+ROPE_PRESET_BY_ELEVATOR = {
+    "elv-01": "8x19S-IWRC", "elv-02": "6x19S-FC", "elv-03": "8x19S-FC",
+    "elv-04": "8x19S-IWRC", "elv-05": "PU-belt", "elv-06": "6x19S-FC",
+}
+SHEAVE_PRESET_BY_ELEVATOR = {
+    "elv-01": "GJS-500-7", "elv-02": "GJL-250", "elv-03": "GJS-600-3",
+    "elv-04": "C45", "elv-05": "GJS-500-7", "elv-06": "GJL-250",
+}
+BEARING_PRESET_BY_ELEVATOR = {
+    "elv-01": "SRB", "elv-02": "DGBB", "elv-03": "SRB",
+    "elv-04": "TRB", "elv-05": "DGBB", "elv-06": "SRB",
+}
+TRACTION_PARTS_GEARLESS = ["laminations", "windings", "magnets", "shaft"]
+TRACTION_PARTS_GEARED = ["laminations", "windings", "worm", "shaft-c45"]
+
+
+def default_material_spec(ctype: str, elevator_id: str, drive_type: str) -> dict:
+    """The material spec a new component of this type/elevator ships with."""
+    if ctype == "traction":
+        parts = TRACTION_PARTS_GEARED if drive_type == "Geared" else TRACTION_PARTS_GEARLESS
+        return {"rows": [MATERIALS.apply_preset("traction", p) for p in parts]}
+    preset_by_elevator = {"rope": ROPE_PRESET_BY_ELEVATOR, "sheave": SHEAVE_PRESET_BY_ELEVATOR,
+                          "bearing": BEARING_PRESET_BY_ELEVATOR}.get(ctype, {})
+    preset_id = preset_by_elevator.get(elevator_id)
+    return MATERIALS.apply_preset(ctype, preset_id) if preset_id else {}
 
 # damage = hidden wear level (0 new .. 1 end of life) at the start of the history window.
 # rope_imbalance_now / rope_growth: rope tension spread (%) reached at the end of the history window
@@ -103,7 +135,7 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
     s = s or get_settings()
     history_days = history_days or s.seed_history_days
     if reset:
-        for name in ["elevators", "components", "sensor_readings", "predictions", "complaints",
+        for name in ["elevators", "components", "sensor_readings", "predictions", "complaints", "sensors",
                      "energy_logs", "alerts", "simulator_state", "simulator_config", "maintenance_logs"]:
             await db[name].delete_many({})
     await seed_users(db, s)
@@ -117,6 +149,9 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
 
     for e in FLEET:
         elevator = {k: v for k, v in e.items() if k != "components"}
+        elevator["lift_type"] = "traction"                      # fixed: traction lifts only
+        elevator.setdefault("drive_type", "Geared" if e["_id"] == "elv-05" else "Gearless PM")
+        elevator["sensor_source"] = "simulated"
         elevator["status"] = "good"
         elevator["created_at"] = now
         await db.elevators.insert_one(elevator)
@@ -132,12 +167,17 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
                 S.advance(prof, state, 24.0, rng)
                 days += 1
             if "rope_growth" in spec:
+                # demo lift: make the LAST rope (R6) the most-loaded one so the report names it
+                n_ropes = prof.rope_pattern.shape[1]
+                prof.rope_pattern[0] = np.array([-1.0 / (n_ropes - 1)] * (n_ropes - 1) + [1.0])
                 prof.imbalance_growth_pct_per_day[:] = spec["rope_growth"]
                 start = spec["rope_imbalance_now"] - spec["rope_growth"] * history_days
                 state.imbalance_pct[:] = max(2.0, start)
                 # short histories: jump the wear forward so the scenario still ends at-risk
                 state.damage[:] = max(state.damage[0], spec["damage"] + max(0.0, 0.3 - 0.005 * history_days))
             source.units[cid] = (prof, state)
+            mat_spec = default_material_spec(ctype, e["_id"], elevator["drive_type"])
+            mat_params = MATERIALS.resolve(ctype, mat_spec)["params"] if mat_spec else {}
             await db.components.insert_one({
                 "_id": cid,
                 "elevator_id": e["_id"],
@@ -152,6 +192,10 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
                 "last_cycle_count": float(np.floor(state.cycle_count[0])),
                 "last_reading_at": None,
                 "sensor_source": "simulator",
+                "material_spec": mat_spec,
+                "physics_params": mat_params,
+                "material_spec_updated_at": now,
+                "material_spec_updated_by": "seed",
             })
 
     # Replay the history through the live ingestion pipeline in 12 h chunks.
@@ -164,10 +208,14 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
         t += timedelta(hours=chunk_h)
     await source.save()
 
-    # Elevator roll-up status
+    # Elevator roll-up status + auto-registered sensor set (spec section 4)
     from .services.views import refresh_elevator_status
     for e in FLEET:
         await refresh_elevator_status(db, e["_id"])
+        comps = [c async for c in db.components.find({"elevator_id": e["_id"]})]
+        for d in default_sensors(e, comps):
+            d["_id"] = f"{e['_id']}:{d['sensor_id']}"
+            await db.sensors.update_one({"_id": d["_id"]}, {"$set": d}, upsert=True)
 
     for elevator_id, days_ago, text in SAMPLE_COMPLAINTS:
         await db.complaints.insert_one({
@@ -175,6 +223,33 @@ async def seed(db, s: Settings | None = None, history_days: int | None = None, r
             "elevator_id": elevator_id, "timestamp": now - timedelta(days=days_ago, hours=3),
             "description": text, "status": "open", "submitted_without_login": True,
             "contact": None, "category": "noise/vibration"})
+
+    # Seed initial service history into maintenance_logs (Section 11 & 12)
+    sample_logs = [
+        {"_id": "mnt-seed-1", "elevator_id": "elv-03", "component_id": "elv-03-rope", "component_name": "Suspension ropes",
+         "kind": "Inspection", "notes": "Rope tension check: detected early tension imbalance on rope R6.",
+         "timestamp": now - timedelta(days=40), "by": "K. Sharma"},
+        {"_id": "mnt-seed-2", "elevator_id": "elv-03", "component_id": "elv-03-sheave", "component_name": "Traction sheave",
+         "kind": "Lubrication", "notes": "Cleaned groove profiles and lubricated drive bearing housing.",
+         "timestamp": now - timedelta(days=120), "by": "M. Patel"},
+        {"_id": "mnt-seed-3", "elevator_id": "elv-03", "component_id": "elv-03-bearing", "component_name": "Sheave bearing",
+         "kind": "Adjustment", "notes": "Vibration baseline check and alignment audit.",
+         "timestamp": now - timedelta(days=210), "by": "K. Sharma"},
+        {"_id": "mnt-seed-4", "elevator_id": "elv-01", "component_id": "elv-01-traction", "component_name": "Traction machine",
+         "kind": "Inspection", "notes": "Motor insulation test passed (450 MOhm).",
+         "timestamp": now - timedelta(days=60), "by": "A. Kumar"},
+        {"_id": "mnt-seed-5", "elevator_id": "elv-01", "component_id": "elv-01-bearing", "component_name": "Sheave bearing",
+         "kind": "Lubrication", "notes": "Regreased main shaft bearing assembly.",
+         "timestamp": now - timedelta(days=180), "by": "A. Kumar"},
+        {"_id": "mnt-seed-6", "elevator_id": "elv-02", "component_id": "elv-02-bearing", "component_name": "Sheave bearing",
+         "kind": "Inspection", "notes": "Bearing high vibration alert: raceway acoustic emission check.",
+         "timestamp": now - timedelta(days=15), "by": "R. Nair"},
+        {"_id": "mnt-seed-7", "elevator_id": "elv-02", "component_id": "elv-02-rope", "component_name": "Suspension ropes",
+         "kind": "Adjustment", "notes": "Equalised rope tensions across 6 suspension ropes.",
+         "timestamp": now - timedelta(days=90), "by": "R. Nair"},
+    ]
+    for mlog in sample_logs:
+        await db.maintenance_logs.update_one({"_id": mlog["_id"]}, {"$set": mlog}, upsert=True)
 
     await db.simulator_config.update_one(
         {"_id": "config"}, {"$set": {"mode": s.sim_mode, "sim_time": now}}, upsert=True)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score
 
 from . import physics as P
 from . import simulator as S
-from .features import PER_READING_KEYS, reading_features, to_vector, window_features
+from .features import PER_READING_KEYS, life_increment_from_features, reading_features, window_features_batch
 from .signal import synthesize, waveform_features
 
 ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
@@ -70,9 +71,10 @@ def simulate_trajectories(ctype: str, n_traj: int, rng: np.random.Generator):
         trips = S.advance(prof, state, DT_HOURS, rng)
         obs = S.observe(prof, state, (step * DT_HOURS) % 24, rng, with_waveform=False)
         rf = reading_features(ctype, obs)
-        # Fatigue index is computed from *observed* data exactly as the live
-        # ingestion pipeline does (trips x load factor from tension sensors).
-        fatigue_obs = fatigue_obs + P.miner_increment(ctype, trips, rf["load_factor"])
+        # Life fraction is computed from *observed* data exactly as the live
+        # ingestion pipeline does (trips x load factor from tension sensors,
+        # plus the winding temperature for the machine's Arrhenius term).
+        fatigue_obs = fatigue_obs + life_increment_from_features(ctype, trips, rf)
         for k in cheap_keys:
             hist[k].append(rf[k])
         amp_hist.append(obs["vib_amplitude"])
@@ -112,15 +114,13 @@ def build_dataset(ctype: str, n_traj: int, rows_per_traj: int, rng: np.random.Ge
         for k in WAVE_KEYS:
             hist[k][idx, j] = wf[k]
 
-        for s in samples:
-            sl = slice(s - trend_steps, s + 1)
-            t_days = np.arange(sl.start, sl.stop) * DT_HOURS / 24.0
-            per = {k: hist[k][sl, j] for k in PER_READING_KEYS}
-            feats = window_features(t_days, per, fatigue[s, j])
-            X.append(to_vector(feats))
-            y_rul.append((f - s) * DT_HOURS / 24.0)
-            groups.append(j)
-    return np.array(X), np.array(y_rul), np.array(groups)
+        # All sampled windows of this unit in one vectorised call (identical
+        # numbers to the per-window `window_features` used live).
+        per = {k: hist[k][:, j] for k in PER_READING_KEYS}
+        X.append(window_features_batch(DT_HOURS / 24.0, per, fatigue[:, j], samples))
+        y_rul.append((f - samples) * DT_HOURS / 24.0)
+        groups.append(np.full(len(samples), j))
+    return np.vstack(X), np.concatenate(y_rul), np.concatenate(groups)
 
 
 def train_component(ctype: str, n_traj: int, rows_per_traj: int, seed: int) -> dict:
@@ -145,16 +145,23 @@ def train_component(ctype: str, n_traj: int, rows_per_traj: int, seed: int) -> d
 
     p = clf.predict_proba(X[test])[:, 1]
     rul_pred = np.expm1(reg.predict(X[test]))
-    near = rul[test] <= 365
+    near_1y = rul[test] <= 365
+    near_90d = rul[test] <= 90
+    near_30d = rul[test] <= 30
+    near_7d = rul[test] <= 7
     metrics = {
         "rows_train": int((~test).sum()),
         "rows_test": int(test.sum()),
         "units": int(len(uniq)),
         "roc_auc": float(roc_auc_score(y[test], p)) if len(np.unique(y[test])) > 1 else None,
         "brier": float(brier_score_loss(y[test], p)),
-        "rul_mae_days_within_1y": float(mean_absolute_error(rul[test][near], rul_pred[near])) if near.any() else None,
-        "rul_mae_days_within_90d": (float(mean_absolute_error(rul[test][rul[test] <= 90], rul_pred[rul[test] <= 90]))
-                                    if (rul[test] <= 90).any() else None),
+        "rul_mae_days_within_1y": float(mean_absolute_error(rul[test][near_1y], rul_pred[near_1y])) if near_1y.any() else None,
+        "rul_mae_days_within_90d": (float(mean_absolute_error(rul[test][near_90d], rul_pred[near_90d]))
+                                    if near_90d.any() else None),
+        "rul_mae_days_within_30d": (float(mean_absolute_error(rul[test][near_30d], rul_pred[near_30d]))
+                                    if near_30d.any() else None),
+        "rul_mae_days_within_7d": (float(mean_absolute_error(rul[test][near_7d], rul_pred[near_7d]))
+                                   if near_7d.any() else None),
         "median_unit_life_days": float(np.median([rul[groups == g].max() for g in uniq])),
     }
 
@@ -179,7 +186,11 @@ def train_component(ctype: str, n_traj: int, rows_per_traj: int, seed: int) -> d
 
 
 def train_all(out_dir: Path = ARTIFACT_DIR, n_traj: int = 60, rows_per_traj: int = 240,
-              seed: int = 7, verbose: bool = True) -> Path:
+              seed: int = 7, verbose: bool = True, n_jobs: int = -1) -> Path:
+    """
+    Train all four component models. The four types are independent, so they
+    are trained in parallel processes (n_jobs=-1 -> one per core; 1 -> serial).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     trained_at = datetime.now(timezone.utc)
     bundle = {
@@ -187,10 +198,20 @@ def train_all(out_dir: Path = ARTIFACT_DIR, n_traj: int = 60, rows_per_traj: int
         "trained_at": trained_at.isoformat(),
         "feature_names": list(P.FEATURE_NAMES),
         "horizon_days": P.FAILURE_HORIZON_DAYS,
+        "physics_models": P.PHYSICS_MODEL,
         "models": {},
     }
-    for i, ctype in enumerate(P.COMPONENT_TYPES):
-        res = train_component(ctype, n_traj, rows_per_traj, seed + i)
+    jobs = [(ctype, n_traj, rows_per_traj, seed + i) for i, ctype in enumerate(P.COMPONENT_TYPES)]
+    if n_jobs < 1:
+        n_jobs = min(len(jobs), os.cpu_count() or 1)
+    if n_jobs == 1:
+        results = [train_component(*j) for j in jobs]
+    else:
+        from joblib import Parallel, delayed
+
+        results = Parallel(n_jobs=min(len(jobs), n_jobs))(
+            delayed(train_component)(*j) for j in jobs)
+    for (ctype, *_), res in zip(jobs, results):
         bundle["models"][ctype] = res
         if verbose:
             print(f"[train] {ctype:9s} {json.dumps(res['metrics'])}")
@@ -209,8 +230,9 @@ def main() -> None:
     ap.add_argument("--units", type=int, default=60, help="simulated units per component type")
     ap.add_argument("--rows", type=int, default=240, help="training rows sampled per unit")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--jobs", type=int, default=-1, help="parallel processes (1 = serial)")
     args = ap.parse_args()
-    path = train_all(args.out, args.units, args.rows, args.seed)
+    path = train_all(args.out, args.units, args.rows, args.seed, n_jobs=args.jobs)
     print(f"[train] saved {path}")
 
 

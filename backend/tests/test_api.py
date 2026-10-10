@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -105,9 +105,18 @@ def test_simulator_toggle_requires_admin(client, staff, admin):
 def test_run_batch_ingests_readings(client, admin):
     before = client.get("/components/elv-01-bearing", headers=admin).json()["last_reading_at"]
     r = client.post("/simulator/run-batch", headers=admin).json()
-    assert r["result"]["ingested"] == 24 * 6
-    after = client.get("/components/elv-01-bearing", headers=admin).json()["last_reading_at"]
-    assert after > before
+    # A full batch is 24 components x 6 hourly readings = 144, but the sim
+    # clock is clamped to never overshoot real time (Section 2), so once the
+    # gap between sim time and now is under 6h the batch is shortened rather
+    # than pushed into the future - ingested is a whole number of hourly
+    # rounds (a multiple of 24) and never more than a full batch.
+    assert 0 <= r["result"]["ingested"] <= 24 * 6
+    assert r["result"]["ingested"] % 24 == 0
+    status = client.get("/simulator/status", headers=admin).json()
+    assert datetime.fromisoformat(status["sim_time"].replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+    if r["result"]["ingested"] > 0:
+        after = client.get("/components/elv-01-bearing", headers=admin).json()["last_reading_at"]
+        assert after > before
 
 
 def test_external_ingest_endpoint(client, staff):

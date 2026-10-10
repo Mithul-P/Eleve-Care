@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .db import connect, disconnect, get_db, iso, utcnow
-from .routers import analytics, auth, chatbot, complaints, components, elevators, ingest, notifications, simulator, stream
+from .routers import (analytics, auth, chatbot, complaints, components, elevators, ingest,
+                      notifications, operations, sensors, simulator, stream)
 from .services.ingestion import IngestionPipeline
 from .services.ml import get_predictor, load_predictor
+from .services.sensor_hub import SensorHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("elevcare")
@@ -31,6 +33,8 @@ async def lifespan(app: FastAPI):
         if await seed(db, s):
             log.info("Database seeded with demo fleet")
     app.state.pipeline = IngestionPipeline(db, s.energy_tariff_inr_per_kwh)
+    app.state.hub = SensorHub(db, app.state.pipeline)
+    await app.state.hub.load()
     app.state.runner = None
     app.state.source = None
     if s.sim_enabled:
@@ -38,11 +42,12 @@ async def lifespan(app: FastAPI):
         from .services.simulated_source import SimulatedSource
 
         app.state.source = SimulatedSource(db)
-        app.state.runner = SimulatorRunner(db, s, app.state.pipeline, app.state.source)
+        app.state.runner = SimulatorRunner(db, s, app.state.pipeline, app.state.source, app.state.hub)
         await app.state.runner.start()
     yield
     if app.state.runner:
         await app.state.runner.stop()
+    await app.state.hub.persist_state()
     await disconnect()
 
 
@@ -61,7 +66,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    for r in (auth, elevators, components, analytics, complaints, chatbot, notifications, simulator, ingest, stream):
+    for r in (auth, elevators, components, analytics, complaints, chatbot, notifications,
+              operations, simulator, ingest, sensors, stream):
         app.include_router(r.router)
 
     @app.get("/health", tags=["meta"])

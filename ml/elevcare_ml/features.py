@@ -19,6 +19,16 @@ from . import physics as P
 from .signal import waveform_features
 from .simulator import NOMINAL_ROPE_TENSION_KN
 
+
+def life_increment_from_features(component_type: str, trips, feats: dict, params: dict | None = None) -> np.ndarray:
+    """
+    Life-fraction consumed by `trips` given the *observed* per-reading features
+    (load factor from tension sensors; winding temperature rise for the
+    machine's Arrhenius term). Used identically by training and live ingestion.
+    """
+    return P.life_increment(component_type, trips, feats["load_factor"],
+                            feats.get("temperature_rise") if component_type == "traction" else None, params)
+
 LEVEL_WINDOW_DAYS = 1.0
 TREND_WINDOW_DAYS = 7.0
 
@@ -111,3 +121,51 @@ def window_features(times_days: np.ndarray, per_reading: dict[str, np.ndarray], 
 
 def to_vector(feats: dict[str, float]) -> np.ndarray:
     return np.array([feats.get(k, 0.0) for k in P.FEATURE_NAMES], dtype=float)
+
+
+def to_matrix(feats_list: list[dict[str, float]]) -> np.ndarray:
+    return np.array([[f.get(k, 0.0) for k in P.FEATURE_NAMES] for f in feats_list], dtype=float)
+
+
+def window_features_batch(step_days: float, per_reading: dict[str, np.ndarray], fatigue: np.ndarray,
+                          samples: np.ndarray) -> np.ndarray:
+    """
+    Vectorised `window_features` for *uniformly spaced* histories (training).
+
+    per_reading[key] is (steps,), fatigue is (steps,), samples (m,) are the
+    step indices to evaluate. Returns an (m, len(FEATURE_NAMES)) matrix that
+    is bit-for-bit identical to calling `window_features` per sample - the
+    unit test `test_batch_window_features_match` enforces it - but ~30x faster
+    because the 24 h medians and 7-day slopes are computed as gathers.
+    """
+    samples = np.asarray(samples, dtype=int)
+    k_level = int(np.floor(LEVEL_WINDOW_DAYS / step_days + 1e-9))
+    k_trend = int(np.floor(TREND_WINDOW_DAYS / step_days + 1e-9))
+    if samples.min() < k_trend:
+        raise ValueError("samples must leave room for the trend window")
+    level_idx = samples[:, None] + np.arange(-k_level, 1)[None, :]
+    trend_idx = samples[:, None] + np.arange(-k_trend, 1)[None, :]
+    t_trend = trend_idx * step_days
+    tc = t_trend - t_trend.mean(axis=1, keepdims=True)
+    denom = np.sum(tc * tc, axis=1)
+
+    def slope(key: str) -> np.ndarray:
+        y = np.asarray(per_reading[key], float)[trend_idx]
+        num = np.sum(tc * (y - y.mean(axis=1, keepdims=True)), axis=1)
+        out = np.where(denom > 0, num / np.where(denom > 0, denom, 1.0), 0.0)
+        ok = (k_trend + 1 >= 3) & ((t_trend.max(axis=1) - t_trend.min(axis=1)) >= 0.75)
+        return np.maximum(0.0, np.where(ok, out, 0.0))
+
+    cols = []
+    for key in P.FEATURE_NAMES:
+        if key == "fatigue_index":
+            cols.append(np.asarray(fatigue, float)[samples])
+        elif key == "rms_trend":
+            cols.append(slope("vib_rms"))
+        elif key == "imbalance_trend":
+            cols.append(slope("tension_imbalance_pct"))
+        elif key in per_reading:
+            cols.append(np.median(np.asarray(per_reading[key], float)[level_idx], axis=1))
+        else:
+            cols.append(np.zeros(len(samples)))
+    return np.column_stack(cols)

@@ -3,7 +3,7 @@ import { Link, NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import { fmt } from '../format'
-import { IconAlert, IconBell, IconBolt, IconChart, IconCpu, IconElevator, IconExternal, IconInbox, IconInfo, IconLeaf, IconLogout, IconPlay, Logo } from '../icons'
+import { IconAlert, IconBell, IconBolt, IconChart, IconCpu, IconElevator, IconExternal, IconInbox, IconInfo, IconLayers, IconLeaf, IconLogout, IconPlay, Logo } from '../icons'
 import { useLive, useLiveFetch } from '../live'
 import ChatPanel from './ChatPanel'
 
@@ -39,10 +39,18 @@ function SimulatorControl() {
         <button className={!realtime ? 'on' : ''} disabled={!isAdmin || busy} onClick={() => toggle('batch')}>Batch · {sim.batch_hours}h</button>
         <button className={realtime ? 'on' : ''} disabled={!isAdmin || busy} onClick={() => toggle('real-time')}>Real-time</button>
       </div>
+      {sim.caught_up && (
+        <span className="badge neutral" title="The simulation clock has reached real time and cannot run ahead of it">Caught up</span>
+      )}
       {realtime ? (
         <span className="badge live"><span className="dot pulse" style={{ background: 'var(--critical)' }} />Live · {sim.realtime_interval_seconds}s</span>
       ) : (
-        isAdmin && <button className="btn sm" disabled={busy} onClick={runBatch} title="Generate and ingest the next batch now"><IconPlay />Run batch now</button>
+        isAdmin && (
+          <button className="btn sm" disabled={busy || sim.caught_up} onClick={runBatch}
+            title={sim.caught_up ? 'Nothing to batch yet - simulated time is already at real time' : 'Generate and ingest the next batch now'}>
+            <IconPlay />Run batch now
+          </button>
+        )
       )}
       <span className="dot" title={connected ? 'Stream connected' : 'Stream disconnected'} style={{ background: connected ? 'var(--good)' : 'var(--text-muted)' }} />
     </div>
@@ -108,6 +116,10 @@ export default function Layout() {
   const { data: complaints } = useLiveFetch('/complaints?status=open')
   const nav = [
     { to: '/elevators', label: 'Elevators', icon: IconElevator },
+    { to: '/sensors', label: 'Sensor inputs', icon: IconCpu },
+    { to: '/recommendations', label: 'Recommendations', icon: IconAlert },
+    { to: '/cycles', label: 'Usage cycles', icon: IconChart },
+    { to: '/materials', label: 'Materials', icon: IconLayers },
     { to: '/energy', label: 'Cost & energy', icon: IconBolt },
     { to: '/sustainability', label: 'Sustainability', icon: IconLeaf },
     { to: '/complaints', label: 'Complaints', icon: IconInbox, count: complaints?.length },

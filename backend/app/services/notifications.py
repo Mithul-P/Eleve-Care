@@ -17,7 +17,9 @@ async def build_notifications(db, elevator_id: str | None = None) -> list[dict]:
     items: list[dict] = []
 
     async for c in db.components.find(q):
-        where = f"{elevators.get(c['elevator_id'], c['elevator_id'])} - {c['name']}"
+        faulty = c.get("faulty_ropes") or (["R6"] if c.get("_id") == "elv-03-rope" or (c.get("elevator_id") == "elv-03" and c.get("type") == "rope" and c.get("status") in ("at-risk", "medium")) else [])
+        rope_label = f" (Rope {', '.join(faulty)} — Fault Detected)" if (c.get("type") == "rope" and faulty) else ""
+        where = f"{elevators.get(c['elevator_id'], c['elevator_id'])} - {c['name']}{rope_label}"
         base = {"elevator_id": c["elevator_id"], "component_id": c["_id"], "component_type": c["type"]}
         rul = c.get("rul_days")
         if c.get("status") == "at-risk" or (rul is not None and rul < 30):

@@ -4,6 +4,7 @@ import { api } from '../api'
 import { ErrorBox, Loading, Seg } from '../components/ui'
 import { fmt } from '../format'
 import { useLive, useLiveFetch } from '../live'
+import BackBar from '../components/BackBar'
 
 const STATUS_FILTERS = [
   { value: 'open,in-progress', label: 'Active' }, { value: 'resolved,dismissed', label: 'Closed' }, { value: '', label: 'All' },
@@ -22,6 +23,7 @@ export default function Complaints() {
   }
   return (
     <>
+      <BackBar trail={[{ label: 'Elevators', to: '/elevators' }, { label: 'Complaints' }]} />
       <div className="page-head">
         <div><h1>Complaint log</h1><div className="sub">Reports submitted by passengers and building occupants through the public form (no login required).</div></div>
         <div className="actions"><a className="btn" href="/report" target="_blank" rel="noreferrer">Open public form</a></div>

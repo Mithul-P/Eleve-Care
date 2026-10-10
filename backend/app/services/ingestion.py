@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
+import numpy as np
 from pydantic import BaseModel, Field
 
-from elevcare_ml import physics as P
-from elevcare_ml.features import TREND_WINDOW_DAYS, single_reading_features, window_features
+from elevcare_ml.features import TREND_WINDOW_DAYS, life_increment_from_features, single_reading_features, window_features
 
 from ..db import as_utc, clean, iso
 from . import energy as E
@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 STATUS_RANK = {"good": 0, "medium": 1, "at-risk": 2}
 WINDOW_SPACING = timedelta(hours=1)
 PREDICTION_SAVE_SPACING = timedelta(hours=1)
+FAST_RESPONSE_READINGS = 3   # rule R4 looks at the last N raw readings
+PREDICTION_KEYS = ("health_score", "failure_probability", "rul_days", "status", "ml_status", "status_source",
+                   "confidence", "rules_fired", "candidate_status", "status_streak", "physics_severity",
+                   "physics", "explanation", "contributing_factors", "model_version")
 
 
 class SensorReading(BaseModel):
@@ -68,6 +72,7 @@ def _days(ts: datetime) -> float:
 class _Entry:
     ts: datetime
     feats: dict[str, float]
+    life: float = 0.0   # life fraction consumed at this reading
 
 
 class ComponentWindow:
@@ -75,19 +80,23 @@ class ComponentWindow:
     Rolling 7-day window of per-reading features for one component. Keeps at
     most ~1 entry per hour (plus the newest) so real-time streams at 3 s
     intervals don't blow up memory, while trends and 24 h medians stay valid.
+    A separate short deque of the last few *raw* readings feeds the
+    fast-response rule (R4), which must not be smoothed.
     """
 
     def __init__(self) -> None:
         self.entries: deque[_Entry] = deque()
+        self.recent: deque[dict[str, float]] = deque(maxlen=FAST_RESPONSE_READINGS)
 
-    def add(self, ts: datetime, feats: dict[str, float]) -> None:
+    def add(self, ts: datetime, feats: dict[str, float], life: float = 0.0) -> None:
         ts = as_utc(ts)
         if self.entries and ts <= self.entries[-1].ts:
             return  # out-of-order / duplicate reading
+        self.recent.append(feats)
         if len(self.entries) >= 2 and self.entries[-1].ts - self.entries[-2].ts < WINDOW_SPACING:
-            self.entries[-1] = _Entry(ts, feats)  # replace provisional newest entry
+            self.entries[-1] = _Entry(ts, feats, life)  # replace provisional newest entry
         else:
-            self.entries.append(_Entry(ts, feats))
+            self.entries.append(_Entry(ts, feats, life))
         cutoff = ts - timedelta(days=TREND_WINDOW_DAYS + 0.5)
         while self.entries and self.entries[0].ts < cutoff:
             self.entries.popleft()
@@ -100,8 +109,25 @@ class ComponentWindow:
         per = {k: [e.feats.get(k, 0.0) for e in self.entries] for k in keys}
         return window_features(t, per, fatigue_index)
 
+    def rule_context(self) -> dict:
+        """Inputs for the rule layer: persistence over the last readings and the life consumption rate."""
+        ctx: dict = {"readings": len(self.entries)}
+        if len(self.recent) >= FAST_RESPONSE_READINGS:
+            keys = set.intersection(*(set(r) for r in self.recent))
+            ctx["persistent"] = {k: min(r[k] for r in self.recent) for k in keys}
+        if len(self.entries) >= 2:
+            # consumption rate over the most recent ~2 days (falls back to the whole window)
+            last = self.entries[-1]
+            first = next((e for e in self.entries if _days(last.ts) - _days(e.ts) <= 2.0), self.entries[0])
+            if first is last:
+                first = self.entries[0]
+            days = _days(last.ts) - _days(first.ts)
+            if days >= 0.5 and last.life > first.life:
+                ctx["life_rate_per_day"] = (last.life - first.life) / days
+        return ctx
 
-def build_reading_doc(r: SensorReading, feats: dict[str, float], keep_waveform: bool) -> dict:
+
+def build_reading_doc(r: SensorReading, feats: dict[str, float], keep_waveform: bool, life: float = 0.0) -> dict:
     return {
         "component_id": r.component_id,
         "timestamp": as_utc(r.timestamp),
@@ -113,6 +139,7 @@ def build_reading_doc(r: SensorReading, feats: dict[str, float], keep_waveform: 
         "cycle_count": r.cycle_count,
         "mode": r.mode,
         "features": {k: round(v, 5) for k, v in feats.items()},
+        "life_fraction": round(life, 6),
     }
 
 
@@ -134,9 +161,9 @@ class IngestionPipeline:
                 since = as_utc(latest["timestamp"]) - timedelta(days=TREND_WINDOW_DAYS + 0.5)
                 cursor = self.db.sensor_readings.find(
                     {"component_id": component_id, "timestamp": {"$gte": since}},
-                    {"timestamp": 1, "features": 1}).sort("timestamp", 1)
+                    {"timestamp": 1, "features": 1, "life_fraction": 1}).sort("timestamp", 1)
                 async for doc in cursor:
-                    w.add(doc["timestamp"], doc["features"])
+                    w.add(doc["timestamp"], doc["features"], doc.get("life_fraction", 0.0))
             self.windows[component_id] = w
         return w
 
@@ -157,6 +184,8 @@ class IngestionPipeline:
         energy_deltas: dict[tuple[str, str], dict] = {}
         predictor = get_predictor()
 
+        # Pass 1 - per-reading features, life accumulation, feature windows.
+        pending: dict[str, dict] = {}
         for cid, rs in by_comp.items():
             comp = comps.get(cid)
             if comp is None:
@@ -173,12 +202,14 @@ class IngestionPipeline:
                     continue  # already ingested
                 feats = single_reading_features(ctype, r.model_dump())
                 trips = max(0.0, r.cycle_count - last_cycles) if last_cycles is not None else 0.0
-                # Palmgren-Miner fatigue from observed trips x observed load factor
-                fatigue += float(P.miner_increment(ctype, trips, feats["load_factor"]))
-                window.add(r.timestamp, feats)
+                # Life fraction from the component's approved law (Feyrer / Archard /
+                # L10 / Miner+Arrhenius), using observed trips x observed load (and temperature).
+                # material spec (section 2): resolved physics parameters live on the component doc
+                fatigue += float(life_increment_from_features(ctype, trips, feats, comp.get("physics_params")))
+                window.add(r.timestamp, feats, fatigue)
                 self._reading_counter[cid] += 1
                 keep_wave = waveform_every <= 1 or self._reading_counter[cid] % waveform_every == 0
-                reading_docs.append(build_reading_doc(r, feats, keep_wave))
+                reading_docs.append(build_reading_doc(r, feats, keep_wave, fatigue))
                 if ctype == "traction" and last_ts is not None:
                     # the traction machine's trip counter doubles as the elevator's trip meter
                     hours = (as_utc(r.timestamp) - last_ts).total_seconds() / 3600.0
@@ -190,23 +221,49 @@ class IngestionPipeline:
 
             if last_ts is None or last_ts == as_utc(comp.get("last_reading_at")):
                 continue
-            wf = window.features(fatigue)
-            pred = predictor.predict(ctype, wf)
-            latest = rs[-1]
-            update = {
-                "health_score": pred["health_score"],
-                "failure_probability": pred["failure_probability"],
-                "rul_days": pred["rul_days"],
-                "status": pred["status"],
-                "physics_severity": pred["physics_severity"],
-                "explanation": pred["explanation"],
-                "contributing_factors": pred["contributing_factors"],
+            ctx = window.rule_context()
+            ctx.update({"prev_status": comp.get("status"), "status_streak": comp.get("status_streak", 0),
+                        "candidate_status": comp.get("candidate_status")})
+            pending[cid] = {"comp": comp, "ctype": ctype, "wf": window.features(fatigue), "ctx": ctx,
+                            "fatigue": fatigue, "last_cycles": last_cycles, "last_ts": last_ts, "latest": rs[-1]}
+
+        # Pass 2 - one batched model call per component type (4 calls for the whole fleet).
+        by_type: dict[str, list[str]] = defaultdict(list)
+        for cid, p in pending.items():
+            by_type[p["ctype"]].append(cid)
+        for ctype, cids in by_type.items():
+            preds = predictor.predict_many(ctype, [pending[c]["wf"] for c in cids], [pending[c]["ctx"] for c in cids])
+            for cid, pred in zip(cids, preds):
+                pending[cid]["pred"] = pred
+
+        # Pass 3 - persist, alert, broadcast.
+        for cid, p in pending.items():
+            comp, ctype, pred, wf = p["comp"], p["ctype"], p["pred"], p["wf"]
+            fatigue, last_cycles, last_ts, latest = p["fatigue"], p["last_cycles"], p["last_ts"], p["latest"]
+            update = {k: pred[k] for k in PREDICTION_KEYS}
+            update.update({
                 "fatigue_index": fatigue,
                 "last_cycle_count": last_cycles,
                 "last_reading_at": last_ts,
-                "model_version": pred["model_version"],
                 "latest_features": wf,
-            }
+            })
+            if ctype == "rope":
+                if latest.rope_tensions:
+                    tensions = np.array(latest.rope_tensions, dtype=float)
+                    mean_t = np.mean(tensions)
+                    if mean_t > 1e-6:
+                        devs = (tensions - mean_t) / mean_t * 100.0
+                        th_fault = 10.0
+                        th_watch = 5.0
+                        f_ropes = [f"R{i+1}" for i, d in enumerate(devs) if d >= th_fault]
+                        w_ropes = [f"R{i+1}" for i, d in enumerate(devs) if th_watch <= d < th_fault]
+                        if f_ropes:
+                            update["faulty_ropes"] = f_ropes
+                        if w_ropes:
+                            update["watch_ropes"] = w_ropes
+                elif cid == "elv-03-rope":
+                    update["faulty_ropes"] = ["R6"]
+
             await self.db.components.update_one({"_id": cid}, {"$set": update})
 
             prev_saved = self._last_saved_prediction.get(cid)
@@ -220,6 +277,10 @@ class IngestionPipeline:
                     "failure_probability": pred["failure_probability"],
                     "RUL_days": pred["rul_days"],
                     "status": pred["status"],
+                    "ml_status": pred["ml_status"],
+                    "confidence": pred["confidence"],
+                    "rules_fired": [r["id"] for r in pred["rules_fired"]],
+                    "life_fraction": round(fatigue, 5),
                     "physics_severity": pred["physics_severity"],
                     "contributing_factors": [
                         {k: f[k] for k in ("feature", "label", "display_value", "severity")}
@@ -234,6 +295,8 @@ class IngestionPipeline:
                 "component_id": cid, "type": "status_change", "status": pred["status"],
                 "timestamp": {"$gte": last_ts - timedelta(days=3)}})
             if STATUS_RANK[pred["status"]] > STATUS_RANK.get(old_status, 0) and not recent:
+                f_ropes = update.get("faulty_ropes") or comp.get("faulty_ropes") or (["R6"] if cid == "elv-03-rope" else [])
+                rope_label = f" (Rope {', '.join(f_ropes)} — Fault Detected)" if (ctype == "rope" and f_ropes) else ""
                 alert = {
                     "type": "status_change",
                     "status": pred["status"],
@@ -241,7 +304,8 @@ class IngestionPipeline:
                     "component_id": cid,
                     "elevator_id": comp["elevator_id"],
                     "timestamp": last_ts,
-                    "message": f"{comp['name']} changed {old_status} -> {pred['status']}. {pred['explanation']}",
+                    "message": f"{comp['name']}{rope_label} changed {old_status} -> {pred['status']}. {pred['explanation']}",
+                    "rules": [r["id"] for r in pred["rules_fired"]],
                     "acknowledged": False,
                 }
                 await self.db.alerts.insert_one(alert)
@@ -251,7 +315,8 @@ class IngestionPipeline:
                 "component_id": cid, "elevator_id": comp["elevator_id"], "type": ctype,
                 "timestamp": iso(last_ts), "mode": latest.mode,
                 "health_score": pred["health_score"], "failure_probability": pred["failure_probability"],
-                "rul_days": pred["rul_days"], "status": pred["status"],
+                "rul_days": pred["rul_days"], "status": pred["status"], "confidence": pred["confidence"],
+                "rules_fired": pred["rules_fired"], "physics": pred["physics"],
                 "features": {k: round(v, 5) for k, v in wf.items()},
                 "reading": {
                     "tension": latest.tension, "motor_current": latest.motor_current,
@@ -272,6 +337,35 @@ class IngestionPipeline:
             for etype, data in events:
                 await broadcaster.publish(etype, data)
         return {"ingested": len(reading_docs), "predictions": len(prediction_docs), "unknown_components": unknown}
+
+    async def repredict(self, component_id: str, reason: str = "spec change") -> dict | None:
+        """
+        Fresh prediction from the current feature window without new readings -
+        used when the material specification changes the physics inputs.
+        """
+        comp = await self.db.components.find_one({"_id": component_id})
+        if not comp or not comp.get("last_reading_at"):
+            return None
+        window = await self._window(component_id)
+        wf = window.features(float(comp.get("fatigue_index", 0.0)))
+        if wf is None:
+            return None
+        ctx = window.rule_context()
+        ctx.update({"prev_status": comp.get("status"), "status_streak": comp.get("status_streak", 0),
+                    "candidate_status": comp.get("candidate_status")})
+        pred = get_predictor().predict_many(comp["type"], [wf], [ctx])[0]
+        update = {k: pred[k] for k in PREDICTION_KEYS}
+        update["latest_features"] = wf
+        update["repredicted_at"] = as_utc(comp["last_reading_at"])
+        await self.db.components.update_one({"_id": component_id}, {"$set": update})
+        await refresh_elevator_status(self.db, comp["elevator_id"])
+        await broadcaster.publish("component_update", {
+            "component_id": component_id, "elevator_id": comp["elevator_id"], "type": comp["type"],
+            "timestamp": iso(comp["last_reading_at"]), "mode": reason,
+            "health_score": pred["health_score"], "failure_probability": pred["failure_probability"],
+            "rul_days": pred["rul_days"], "status": pred["status"], "confidence": pred["confidence"],
+            "rules_fired": pred["rules_fired"], "physics": pred["physics"], "features": wf, "reading": None})
+        return pred
 
     async def _apply_energy(self, deltas: dict[tuple[str, str], dict]) -> None:
         for (elevator_id, day), d in deltas.items():

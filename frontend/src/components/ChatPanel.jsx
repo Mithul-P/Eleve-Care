@@ -5,10 +5,11 @@ import { IconChat, IconClose, IconSend } from '../icons'
 import { useLive } from '../live'
 
 const SUGGESTIONS = [
-  'Which components are at risk?',
+  'What is happening with the demo lift?',
   "Why is the demo lift's rope at risk?",
+  "How fast is Lift 2's bearing decaying?",
+  'What does the bearing waveform show?',
   'What checkups are due?',
-  'How long will the Lobby Lift traction machine last?',
 ]
 
 // Renders **bold** safely (text nodes only - no HTML injection).
@@ -47,23 +48,34 @@ export default function ChatPanel() {
     }
   }), [subscribe])
 
+  // "Ask the assistant" buttons elsewhere (e.g. the lift report) open the panel with a preset question
+  useEffect(() => {
+    const onAsk = (ev) => { setOpen(true); setTimeout(() => sendRef.current?.(ev.detail?.question, ev.detail?.elevator_id), 50) }
+    window.addEventListener('elevcare:ask', onAsk)
+    return () => window.removeEventListener('elevcare:ask', onAsk)
+  }, [])
+
   useEffect(() => { if (open) setUnread(0) }, [open])
   useEffect(() => { bodyRef.current?.scrollTo(0, bodyRef.current.scrollHeight) }, [messages, open, busy])
 
-  const send = async (text) => {
+  const sendRef = useRef(null)
+  const send = async (text, elevatorId) => {
     const q = (text ?? input).trim()
     if (!q || busy) return
+    const context = elevatorId ? { elevator_id: elevatorId } : ctx
     setInput('')
     const history = messages.filter((x) => x.role === 'user' || x.role === 'assistant').map(({ role, content }) => ({ role, content }))
     setMessages((ms) => [...ms, { role: 'user', content: q }])
     setBusy(true)
     try {
-      const r = await api('/chatbot/query', { method: 'POST', body: { message: q, history, ...ctx } })
+      const r = await api('/chatbot/query', { method: 'POST', body: { message: q, history, ...context } })
       setMessages((ms) => [...ms, { role: 'assistant', content: r.answer, source: r.source }])
     } catch (e) {
       setMessages((ms) => [...ms, { role: 'assistant', content: `Sorry - ${e.message}`, source: 'error' }])
     } finally { setBusy(false) }
   }
+
+  sendRef.current = send
 
   return (
     <>

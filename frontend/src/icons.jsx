@@ -21,6 +21,7 @@ export const IconWrench = I(<path d="M14 6a4 4 0 0 0 5 5l-9 9-4-1-1-4 9-9z" />)
 export const IconLogout = I(<><path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10" /></>)
 export const IconExternal = I(<><path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6" /></>)
 export const IconCpu = I(<><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" /></>)
+export const IconLayers = I(<><path d="M12 3 2 9l10 6 10-6z" /><path d="M2 15l10 6 10-6" /><path d="M2 12l10 6 10-6" /></>)
 
 export function Logo(props) {
   return (
