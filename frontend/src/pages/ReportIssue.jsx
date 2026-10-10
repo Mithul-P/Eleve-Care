@@ -11,12 +11,26 @@ export default function ReportIssue() {
   const [elevators, setElevators] = useState([])
   const [form, setForm] = useState({ elevator_id: elevatorId || '', category: 'noise/vibration', description: '', contact: '' })
   const [state, setState] = useState({ busy: false, error: null, done: null })
+  const [list, setList] = useState({ loading: true, error: null })
+  const [attempt, setAttempt] = useState(0)
 
-  useEffect(() => { api('/public/elevators', { auth: false }).then(setElevators).catch(() => {}) }, [])
+  useEffect(() => {
+    let active = true
+    setList({ loading: true, error: null })
+    api('/public/elevators', { auth: false }).then((rows) => {
+      if (!active) return
+      setElevators(rows)
+      setList({ loading: false, error: null })
+    }).catch(() => {
+      if (active) setList({ loading: false, error: 'We could not load the lift list. Please try again.' })
+    })
+    return () => { active = false }
+  }, [attempt])
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
 
   const submit = async (e) => {
     e.preventDefault()
+    if (list.loading || list.error || !elevators.some((x) => x.id === form.elevator_id)) return
     setState({ busy: true, error: null, done: null })
     try {
       const r = await api('/complaints', { method: 'POST', auth: false, body: { ...form, contact: form.contact || null } })
@@ -30,14 +44,18 @@ export default function ReportIssue() {
     <div className="center-page">
       <form className="card auth-card" style={{ maxWidth: 480 }} onSubmit={submit}>
         <div className="brand"><Logo className="brand-mark" /><div><div className="brand-name">Report a lift issue</div><div className="brand-sub">No account needed · goes straight to the maintenance team</div></div></div>
-        {state.done && <div className="success" style={{ marginBottom: 14 }}>{state.done.message} Reference: <span className="mono">{state.done.id}</span></div>}
-        {state.error && <div className="error">{state.error}</div>}
+        {list.loading && <p role="status">Loading lifts…</p>}
+        {list.error && <div className="error" role="alert">{list.error} <button type="button" className="btn" onClick={() => setAttempt((n) => n + 1)}>Try again</button></div>}
+        {!list.loading && !list.error && !elevators.length && <p role="status">No lifts are available for reports. Please contact building maintenance.</p>}
+        {!list.loading && !list.error && elevatorId && !selected && <p role="alert">This lift link is unavailable. Please select your lift below.</p>}
+        {state.done && <div className="success" role="status" style={{ marginBottom: 14 }}>{state.done.message} Reference: <span className="mono">{state.done.id}</span></div>}
+        {state.error && <div className="error" role="alert">{state.error}</div>}
         {elevatorId && selected ? (
           <div className="field"><label>Elevator</label><div style={{ fontWeight: 600 }}>{selected.name}</div><div className="small muted">{selected.building}</div></div>
         ) : (
           <div className="field">
             <label htmlFor="elv">Elevator</label>
-            <select id="elv" value={form.elevator_id} onChange={set('elevator_id')} required>
+            <select id="elv" value={selected ? form.elevator_id : ''} onChange={set('elevator_id')} disabled={list.loading || Boolean(list.error)} required>
               <option value="" disabled>Select the lift…</option>
               {elevators.map((x) => <option key={x.id} value={x.id}>{x.name} - {x.building}</option>)}
             </select>
@@ -55,7 +73,7 @@ export default function ReportIssue() {
           <label htmlFor="contact">Phone or email (optional)</label>
           <input id="contact" value={form.contact} onChange={set('contact')} maxLength={120} placeholder="Only if you'd like a follow-up" />
         </div>
-        <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }} disabled={state.busy}>{state.busy ? 'Sending…' : 'Submit report'}</button>
+        <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }} disabled={state.busy || list.loading || Boolean(list.error) || !selected}>{state.busy ? 'Sending…' : 'Submit report'}</button>
         <p className="note" style={{ marginTop: 14 }}>If someone is trapped, use the alarm button inside the lift car or call building security immediately.</p>
       </form>
     </div>
